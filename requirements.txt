@@ -1,0 +1,6 @@
+# requirements.txt
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+pypower>=5.1
+openpyxl>=5.1
