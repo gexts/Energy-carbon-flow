@@ -81,7 +81,13 @@ def _load_inputs_wide(xls_path: str):
         "eh_flow_gas": read_sheet("eh_flow_gas"),
         "eh_PCI_gas": read_sheet("eh_PCI_gas"),
         "heat_Q_demand": read_sheet("heat_Q_demand"),
+        # 新增：外部购售电 + 外部碳强度
+        "grid_trade_buy": read_sheet("grid_trade_buy"),             # profile_id + Hxx
+        "grid_trade_sell": read_sheet("grid_trade_sell"),           # profile_id + Hxx
+        "external_CI": read_sheet("external_CI"),                   # profile_id + Hxx
     }
+
+    
 
     hours_cols = [f"H{h:02d}" for h in range(24)]
 
@@ -104,6 +110,15 @@ def _load_inputs_wide(xls_path: str):
 
     if inputs["heat_Q_demand"] is not None:
         _require_cols(inputs["heat_Q_demand"], ["load_id"] + hours_cols, "heat_Q_demand")
+
+    if inputs["grid_trade_buy"] is not None:
+        _require_cols(inputs["grid_trade_buy"], ["profile_id"] + hours_cols, "grid_trade_buy")
+
+    if inputs["grid_trade_sell"] is not None:
+        _require_cols(inputs["grid_trade_sell"], ["profile_id"] + hours_cols, "grid_trade_sell")
+
+    if inputs["external_CI"] is not None:
+        _require_cols(inputs["external_CI"], ["profile_id"] + hours_cols, "external_CI")
 
     return inputs
 
@@ -166,6 +181,65 @@ def _wide_from_series_dict(series_per_hour: dict, id_name: str) -> pd.DataFrame:
     wide = pd.concat(cols, axis=1)
     wide.insert(0, id_name, all_ids)
     return wide
+def _build_power_gen_mix_from_dataset(dataset_dir: str) -> pd.DataFrame:
+    """
+    从 ies_dataset(_extgrid).xlsx 中读取 gen_PG，按照“内部机组 + 外部电网”拆分，
+    组装成宽表 power_gen_mix_MW（metric × H00..H23）。
+
+    返回 DataFrame:
+        metric, H00, H01, ..., H23
+        metric 行：Internal_gen, Grid_import
+    如果找不到数据文件，则返回空 DataFrame。
+    """
+    # 1) 确定数据集路径：优先使用 ies_dataset_extgrid.xlsx
+    cand1 = os.path.join(dataset_dir, "ies_dataset_extgrid.xlsx")
+    cand2 = os.path.join(dataset_dir, "ies_dataset.xlsx")
+    if os.path.exists(cand1):
+        ds_path = cand1
+    elif os.path.exists(cand2):
+        ds_path = cand2
+    else:
+        return pd.DataFrame(columns=["metric"])
+
+    # 2) 读入 bus / gen / gen_PG
+    bus = pd.read_excel(ds_path, sheet_name="power_bus", engine="openpyxl")
+    gen = pd.read_excel(ds_path, sheet_name="power_gen", engine="openpyxl")
+    gen_pg = pd.read_excel(ds_path, sheet_name="gen_PG", engine="openpyxl")
+
+    # bus: 获取 BUS_I, PD
+    if "BUS_I" in bus.columns:
+        bus_ids = bus["BUS_I"].astype(int)
+        PD = bus["PD"].astype(float)
+    else:
+        bus_ids = bus.iloc[:, 0].astype(int)
+        PD = bus.iloc[:, 2].astype(float)
+
+    # gen: 每台机组所在母线（与 gen_PG 行顺序一致）
+    gen_bus = gen.iloc[:, 0].astype(int)
+
+    # 3) 判定“外部电网母线”：有机组，且负荷几乎为 0
+    zero_load_buses = set(bus_ids[np.isclose(PD, 0.0)])
+    cand = sorted(zero_load_buses.intersection(set(gen_bus)))
+    extgrid_bus_id = int(cand[0]) if len(cand) >= 1 else None
+
+    # 4) 按小时累加：内部机组 / 外部电网
+    hour_cols = [c for c in gen_pg.columns if c.startswith("H")]
+    internal = pd.Series(0.0, index=hour_cols, dtype=float)
+    grid_import = pd.Series(0.0, index=hour_cols, dtype=float)
+
+    for i, row in gen_pg.iterrows():
+        bus_id = int(gen_bus.iloc[i])
+        P = row[hour_cols].astype(float)
+        if extgrid_bus_id is not None and bus_id == extgrid_bus_id:
+            grid_import += P
+        else:
+            internal += P
+
+    data = {"metric": ["Internal_gen", "Grid_import"]}
+    for hc in hour_cols:
+        data[hc] = [internal[hc], grid_import[hc]]
+
+    return pd.DataFrame(data)
 
 
 # ========================= 覆盖逻辑（把“横表值”写入 TS） =========================
@@ -301,9 +375,38 @@ def _overlay_heat_loads(TS, inputs_wide, hour: int, convert_to_injection=False):
 # ========================= 逐时主流程 =========================
 
 def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
-                            convert_heat_load_to_injection: bool = False) -> str:
+                            convert_heat_load_to_injection: bool = True) -> str:
     TS0 = build_test_system_from_excel(dataset_dir)
     # —— 新增：构造储热对象（可按需改参数），后续放在excel中配置
+
+    # ---- 识别“外部电网”机组（默认：接在零负荷母线上的机组） ----
+    pw0 = TS0.get("PowerSystem", {})
+    bus0 = np.asarray(pw0.get("bus"))
+    gen0 = np.asarray(pw0.get("gen"))
+
+    extgrid_bus_id = None
+    internal_gen_mask = None
+    if bus0 is not None and gen0 is not None and bus0.size > 0 and gen0.size > 0:
+        try:
+            bus_ids0 = bus0[:, 0].astype(int)
+            PD0      = bus0[:, 2].astype(float)
+            gen_bus0 = gen0[:, 0].astype(int)
+
+            zero_load_buses = set(bus_ids0[np.isclose(PD0, 0.0)])
+            gen_buses       = set(gen_bus0.tolist())
+            cand = sorted(zero_load_buses.intersection(gen_buses))
+
+            # 目前数据中应只有一个“外部电网”机组母线（例如 bus 7）
+            if len(cand) == 1:
+                extgrid_bus_id = int(cand[0])
+            # 生成内部机组掩码（True = 内部机组）
+            if extgrid_bus_id is not None:
+                internal_gen_mask = (gen_bus0 != extgrid_bus_id)
+            else:
+                internal_gen_mask = np.ones(gen0.shape[0], dtype=bool)
+        except Exception:
+            internal_gen_mask = None
+
     pit_cfg = PitThermalStorageConfig(
     H=16.0, W_top=90.0, W_bot=26.0, n_layers=20,
     U_side=111.0, U_top=26.6, U_bot=74.9,
@@ -319,6 +422,10 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
     # —— 并联系统分流统计（可选导出，便于复核）
     perh_heat_source_mix = {}  # index=['EH_total','EH_direct','Pit_out','ToHeat_total','Demand','Charge_to_pit']
     # [STORAGE HOOK] build runtime from storage tables if present
+    # 电源出力分解（内部机组 vs 外部电网）
+    # index = ['Internal_gen', 'Grid_import']，单位 MW
+    perh_power_gen_mix = {}
+
     try:
         stor = build_runtime_from_TS(TS0, delta_t_hours=1.0)
     except Exception:
@@ -326,6 +433,25 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
     xls_path = os.path.join(dataset_dir, "ies_dataset.xlsx")
     inputs_wide = _load_inputs_wide(xls_path)
     os.makedirs(out_dir, exist_ok=True)
+    # 外部接口 / 购售电表 & 碳强度
+    grid_buy_tbl = inputs_wide.get("grid_trade_buy")
+    grid_sell_tbl = inputs_wide.get("grid_trade_sell")
+    ext_ci_tbl = inputs_wide.get("external_CI")
+
+    # 选取 external_CI 中 profile_id = "ext_grid" 的那一行（若无则取第一行）
+    ext_ci_row = None
+    if isinstance(ext_ci_tbl, pd.DataFrame) and not ext_ci_tbl.empty:
+        if "profile_id" in ext_ci_tbl.columns:
+            mask = ext_ci_tbl["profile_id"].astype(str) == "ext_grid"
+            if mask.any():
+                ext_ci_row = ext_ci_tbl.loc[mask].iloc[0]
+            else:
+                ext_ci_row = ext_ci_tbl.iloc[0]
+        else:
+            ext_ci_row = ext_ci_tbl.iloc[0]
+
+    # 外部接口母线 ID（我们在 Excel 里约定为 7）
+    ext_bus_id = 7
 
     # 收集器（已有）
     perh_NCI = {}
@@ -354,19 +480,179 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
 
         # 四大模块
         # [STORAGE HOOK] build extra injections from dispatch
-        extra_loads=None; extra_gens=None
+        # [STORAGE + GRID HOOK] build extra injections from dispatch & grid trades
+        extra_loads = []
+        extra_gens = []
+
+        # 1) 电储能注入（充电->负荷，放电->带 CI 的机组）
         if stor is not None:
             ch_tbl = inputs_wide.get("storage_dispatch_ch")
             dc_tbl = inputs_wide.get("storage_dispatch_dc")
             cmd_ch = {}; cmd_dc = {}
             if isinstance(ch_tbl, pd.DataFrame) and _hcol(h) in ch_tbl.columns and "id" in ch_tbl.columns:
-                cmd_ch = {str(r["id"]): float(r[_hcol(h)]) for _, r in ch_tbl.iterrows() if pd.notna(r.get(_hcol(h)))}
+                cmd_ch = {
+                    str(r["id"]): float(r[_hcol(h)])
+                    for _, r in ch_tbl.iterrows()
+                    if pd.notna(r.get(_hcol(h)))
+                }
             if isinstance(dc_tbl, pd.DataFrame) and _hcol(h) in dc_tbl.columns and "id" in dc_tbl.columns:
-                cmd_dc = {str(r["id"]): float(r[_hcol(h)]) for _, r in dc_tbl.iterrows() if pd.notna(r.get(_hcol(h)))}
+                cmd_dc = {
+                    str(r["id"]): float(r[_hcol(h)])
+                    for _, r in dc_tbl.iterrows()
+                    if pd.notna(r.get(_hcol(h)))
+                }
             add_loads, add_gens = stor.plan_injections(h, cmd_ch, cmd_dc)
-            extra_loads = add_loads
-            extra_gens  = add_gens
-        TS_h = run_power_flow(TS_h, extra_loads=extra_loads, extra_gens=extra_gens)
+            extra_loads.extend(add_loads)
+            extra_gens.extend(add_gens)
+
+        # 2) 外部购售电注入（统一加在 BUS7）
+        P_buy = 0.0
+        P_sell = 0.0
+
+        # 2.1 购电
+        if isinstance(grid_buy_tbl, pd.DataFrame) and _hcol(h) in grid_buy_tbl.columns:
+            df = grid_buy_tbl
+            if "profile_id" in df.columns:
+                mask = df["profile_id"].astype(str) == "ext_grid"
+                row = df.loc[mask].iloc[0] if mask.any() else df.iloc[0]
+            else:
+                row = df.iloc[0]
+            val = row.get(_hcol(h), np.nan)
+            if pd.notna(val):
+                P_buy = float(val)
+
+        # 2.2 售电
+        if isinstance(grid_sell_tbl, pd.DataFrame) and _hcol(h) in grid_sell_tbl.columns:
+            df = grid_sell_tbl
+            if "profile_id" in df.columns:
+                mask = df["profile_id"].astype(str) == "ext_grid"
+                row = df.loc[mask].iloc[0] if mask.any() else df.iloc[0]
+            else:
+                row = df.iloc[0]
+            val = row.get(_hcol(h), np.nan)
+            if pd.notna(val):
+                P_sell = float(val)
+
+        # 2.3 把购电作为新增机组注入（带外部碳强度 CI）
+        if P_buy > 1e-6:
+            if ext_ci_row is not None and _hcol(h) in ext_ci_row.index:
+                w_ext = float(ext_ci_row[_hcol(h)])
+            else:
+                w_ext = 0.0
+            extra_gens.append((ext_bus_id, P_buy, w_ext))
+
+        # 2.4 把售电作为 BUS7 的额外负荷
+        if P_sell > 1e-6:
+            extra_loads.append((ext_bus_id, P_sell))
+
+        # 3) 运行潮流（把储能 + 外部购售电一起带进去）
+        TS_h = run_power_flow(
+            TS_h,
+            extra_loads=extra_loads if extra_loads else None,
+            extra_gens=extra_gens if extra_gens else None,
+        )
+        
+        # [STORAGE + GRID HOOK] build extra injections from dispatch & grid trades
+        extra_loads = []
+        extra_gens = []
+
+        # 1) 电储能注入（充电->负荷，放电->带 CI 的机组）
+        if stor is not None:
+            ch_tbl = inputs_wide.get("storage_dispatch_ch")
+            dc_tbl = inputs_wide.get("storage_dispatch_dc")
+            cmd_ch = {}; cmd_dc = {}
+            if isinstance(ch_tbl, pd.DataFrame) and _hcol(h) in ch_tbl.columns and "id" in ch_tbl.columns:
+                cmd_ch = {
+                    str(r["id"]): float(r[_hcol(h)])
+                    for _, r in ch_tbl.iterrows()
+                    if pd.notna(r.get(_hcol(h)))
+                }
+            if isinstance(dc_tbl, pd.DataFrame) and _hcol(h) in dc_tbl.columns and "id" in dc_tbl.columns:
+                cmd_dc = {
+                    str(r["id"]): float(r[_hcol(h)])
+                    for _, r in dc_tbl.iterrows()
+                    if pd.notna(r.get(_hcol(h)))
+                }
+            add_loads, add_gens = stor.plan_injections(h, cmd_ch, cmd_dc)
+            extra_loads.extend(add_loads)
+            extra_gens.extend(add_gens)
+
+        # 2) 外部购售电注入（统一加在 BUS7）
+        P_buy = 0.0
+        P_sell = 0.0
+
+        # 2.1 购电
+        if isinstance(grid_buy_tbl, pd.DataFrame) and _hcol(h) in grid_buy_tbl.columns:
+            df = grid_buy_tbl
+            if "profile_id" in df.columns:
+                mask = df["profile_id"].astype(str) == "ext_grid"
+                row = df.loc[mask].iloc[0] if mask.any() else df.iloc[0]
+            else:
+                row = df.iloc[0]
+            val = row.get(_hcol(h), np.nan)
+            if pd.notna(val):
+                P_buy = float(val)
+
+        # 2.2 售电
+        if isinstance(grid_sell_tbl, pd.DataFrame) and _hcol(h) in grid_sell_tbl.columns:
+            df = grid_sell_tbl
+            if "profile_id" in df.columns:
+                mask = df["profile_id"].astype(str) == "ext_grid"
+                row = df.loc[mask].iloc[0] if mask.any() else df.iloc[0]
+            else:
+                row = df.iloc[0]
+            val = row.get(_hcol(h), np.nan)
+            if pd.notna(val):
+                P_sell = float(val)
+
+        # 2.3 把购电作为新增机组注入（带外部碳强度 CI）
+        if P_buy > 1e-6:
+            if ext_ci_row is not None and _hcol(h) in ext_ci_row.index:
+                w_ext = float(ext_ci_row[_hcol(h)])
+            else:
+                w_ext = 0.0
+            extra_gens.append((ext_bus_id, P_buy, w_ext))
+
+        # 2.4 把售电作为 BUS7 的额外负荷
+        if P_sell > 1e-6:
+            extra_loads.append((ext_bus_id, P_sell))
+
+        # 3) 运行潮流（把储能 + 外部购售电一起带进去）
+        TS_h = run_power_flow(
+            TS_h,
+            extra_loads=extra_loads if extra_loads else None,
+            extra_gens=extra_gens if extra_gens else None,
+        )
+                # ---- 记录电源出力：内部机组 vs 外部电网（单位 MW）----
+               # ---- 记录电源出力：内部机组 vs 外部电网（单位 MW）----
+        try:
+            pw = TS_h.get("PowerSystem", {})
+            res = pw.get("results", {})
+            baseMVA = float(TS_h['PowerSystem']['baseMVA'])
+            gen_res = np.asarray(res.get("gen"))
+            if gen_res is not None and gen_res.size > 0:
+                gen_bus = gen_res[:, 0].astype(int)
+                PG_pu   = gen_res[:, 1].astype(float)
+
+                # 关键一步：从 “缩小了 baseMVA 倍的 PG” 还原成 MW
+                PG_MW   = PG_pu * baseMVA
+
+                if extgrid_bus_id is not None:
+                    ext_mask = (gen_bus == int(extgrid_bus_id))
+                    PG_ext = float(PG_MW[ext_mask].sum())   # Grid_import [MW]
+                    PG_int = float(PG_MW[~ext_mask].sum())  # Internal_gen [MW]
+                else:
+                    PG_int = float(PG_MW.sum())
+                    PG_ext = 0.0
+
+                perh_power_gen_mix[_hcol(h)] = pd.Series(
+                    {"Internal_gen": PG_int, "Grid_import": PG_ext}
+                )
+
+        except Exception:
+            # 出问题时该小时留空，但不要让整个仿真挂掉
+            perh_power_gen_mix[_hcol] = None
+
         # [STORAGE HOOK] update es states based on node CIs
         if stor is not None and isinstance(TS_h.get("PowerSystem",{}).get("NCI", None), np.ndarray):
             EN = np.asarray(TS_h['PowerSystem']['NCI'], dtype=float).ravel()
@@ -568,6 +854,13 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
         _wide_from_series_dict(perh_pit_wes, "scope").to_excel(w, sheet_name="storage_heat_wes_tperMWh", index=False)
         _wide_from_series_dict(perh_pit_E,   "scope").to_excel(w, sheet_name="storage_heat_E_t", index=False)
         _wide_from_series_dict(perh_heat_source_mix, "metric").to_excel(w, sheet_name="heat_source_mix_MW", index=False)
+
+        # 内部机组 / 外部电网出力（来自逐时潮流结果）
+        _wide_from_series_dict(
+            perh_power_gen_mix,
+            "metric"
+        ).to_excel(w, sheet_name="power_gen_mix_MW", index=False)
+
         # [STORAGE HOOK] export
         try:
             if stor is not None:
