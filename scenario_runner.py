@@ -49,11 +49,7 @@ def _require_cols(df: pd.DataFrame, needed, where: str):
     if miss:
         raise KeyError(f"[输入缺列] {where} 缺少列：{miss}")
 
-def _load_inputs_wide(xls_path: str):
-    """
-from storage import build_runtime_from_TS
-import copy
-读取横表输入，若缺失则返回 None；存在则检查必需列。"""
+
 from storage import build_runtime_from_TS
 import copy
 
@@ -81,6 +77,11 @@ def _load_inputs_wide(xls_path: str):
         "eh_flow_gas": read_sheet("eh_flow_gas"),
         "eh_PCI_gas": read_sheet("eh_PCI_gas"),
         "heat_Q_demand": read_sheet("heat_Q_demand"),
+        "gas_load_demand": read_sheet("gas_load_demand"),                 # load_id + Hxx  (km3/h)
+        "gas_source_output_fixed": read_sheet("gas_source_output_fixed"), # source_id + Hxx (km3/h) 可选
+        "gas_load_demand": read_sheet("gas_load_demand"),
+
+
         # 新增：外部购售电 + 外部碳强度
         "grid_trade_buy": read_sheet("grid_trade_buy"),             # profile_id + Hxx
         "grid_trade_sell": read_sheet("grid_trade_sell"),           # profile_id + Hxx
@@ -110,6 +111,18 @@ def _load_inputs_wide(xls_path: str):
 
     if inputs["heat_Q_demand"] is not None:
         _require_cols(inputs["heat_Q_demand"], ["load_id"] + hours_cols, "heat_Q_demand")
+    
+    if inputs["gas_load_demand"] is not None:
+        if ("id" not in inputs["gas_load_demand"].columns) and ("load_id" not in inputs["gas_load_demand"].columns):
+            raise KeyError("gas_load_demand 需包含 id 或 load_id 列")
+        _require_cols(inputs["gas_load_demand"], [("id" if "id" in inputs["gas_load_demand"].columns else "load_id")] + hours_cols, "gas_load_demand")
+
+    
+    if inputs["gas_load_demand"] is not None:
+        _require_cols(inputs["gas_load_demand"], ["load_id"] + hours_cols, "gas_load_demand")
+
+    if inputs["gas_source_output_fixed"] is not None:
+        _require_cols(inputs["gas_source_output_fixed"], ["source_id"] + hours_cols, "gas_source_output_fixed")
 
     if inputs["grid_trade_buy"] is not None:
         _require_cols(inputs["grid_trade_buy"], ["profile_id"] + hours_cols, "grid_trade_buy")
@@ -181,6 +194,7 @@ def _wide_from_series_dict(series_per_hour: dict, id_name: str) -> pd.DataFrame:
     wide = pd.concat(cols, axis=1)
     wide.insert(0, id_name, all_ids)
     return wide
+
 def _build_power_gen_mix_from_dataset(dataset_dir: str) -> pd.DataFrame:
     """
     从 ies_dataset(_extgrid).xlsx 中读取 gen_PG，按照“内部机组 + 外部电网”拆分，
@@ -283,6 +297,43 @@ def _overlay_power_loads(TS, inputs_wide, hour: int, strict_assert=True, snap_PD
             raise AssertionError(f"[{h}] PD覆盖不一致：L1相对误差={l1err:.3e}，请检查 BUS_I 匹配/列名/单位。")
     return TS2
 
+def _overlay_gas_timeseries(TS, inputs_wide, hour: int):
+    TS2 = TS
+    h = _hcol(hour)
+
+    # 1) 覆盖负荷 demand（km3/h）
+    gw = inputs_wide.get("gas_load_demand", None)
+    if gw is not None:
+        loads = TS2["GasSystem"]["loads"].copy()
+        # loads: id, node, demand
+        for _, r in gw.iterrows():
+            lid = int(r["load_id"])
+            if h in r.index and pd.notna(r[h]):
+                val = float(r[h])
+                hit = loads["id"].astype(int) == lid
+                if hit.any():
+                    loads.loc[hit, "demand"] = val
+        TS2["GasSystem"]["loads"] = loads
+
+    # 2) （可选）覆盖“非 slack 源”的固定出力 output（km3/h）
+    sw = inputs_wide.get("gas_source_output_fixed", None)
+    if sw is not None:
+        src = TS2["GasSystem"]["sources"].copy()
+        for _, r in sw.iterrows():
+            sid = int(r["source_id"])
+            if h in r.index and pd.notna(r[h]):
+                val = float(r[h])
+                hit = src["id"].astype(int) == sid
+                if hit.any():
+                    src.loc[hit, "output"] = val
+                    # 固定源强制非 slack（避免误配）
+                    if "is_slack" in src.columns:
+                        src.loc[hit, "is_slack"] = 0
+        TS2["GasSystem"]["sources"] = src
+
+    return TS2
+
+
 def _overlay_eh_inputs(TS, inputs_wide, hour: int, snap_EH=None):
     TS2 = TS
     h = _hcol(hour)
@@ -317,7 +368,9 @@ def _overlay_eh_inputs(TS, inputs_wide, hour: int, snap_EH=None):
             inp.loc[inp["type_norm"] == "gas", "PCI"] = float(pci_vals.iloc[0])
 
     EH["inputs"] = inp.drop(columns=["type_norm"], errors="ignore")
-    EH["respect_inputs"] = True
+    EH["respect_inputs"] = bool(
+    (ew is not None) or (gw is not None)
+)
     TS2["EnergyHubs"] = EH
 
     if snap_EH is not None:
@@ -371,6 +424,94 @@ def _overlay_heat_loads(TS, inputs_wide, hour: int, convert_to_injection=False):
             TS2["HeatSystem"]["nodes"] = nodes
     return TS2
 
+def _overlay_gas_loads(TS, inputs_wide, hour: int):
+    TS2 = TS
+    h = _hcol(hour)
+    gw = inputs_wide.get("gas_load_demand", None)
+    if gw is None or h not in gw.columns:
+        return TS2
+
+    GS = TS2.get("GasSystem", {})
+    loads = GS.get("loads", None)
+    if loads is None or not hasattr(loads, "copy"):
+        return TS2
+    loads = loads.copy()
+
+    # 兼容 id / load_id
+    key_col = "id" if "id" in loads.columns else ("load_id" if "load_id" in loads.columns else None)
+    if key_col is None:
+        return TS2
+
+    key_in = "id" if "id" in gw.columns else ("load_id" if "load_id" in gw.columns else None)
+    if key_in is None:
+        raise KeyError("gas_load_demand 缺少 id/load_id 列")
+
+    id2row = {int(v): i for i, v in enumerate(loads[key_col].astype(int).tolist())}
+
+    for _, r in gw.iterrows():
+        lid = int(r[key_in])
+        if lid in id2row and not pd.isna(r[h]):
+            loads.loc[id2row[lid], "demand"] = float(r[h])
+
+    TS2["GasSystem"]["loads"] = loads
+    return TS2
+
+
+def _heat_build_injection_with_slack(HS, dT: float = 15.0, cp: float = 4200.0):
+    """
+    强制热网满足 Demand：由 loads.Q_demand 构造 nodes.injection（kg/s），并用 sources[0] 作为 slack 平衡。
+    约定（与现有热网数据表的符号一致）：
+      - injection > 0：向网络注入（热源）
+      - injection < 0：从网络抽取（热负荷）
+    """
+    nodes   = HS["nodes"].copy()
+    loads   = HS.get("loads", pd.DataFrame()).copy()
+    sources = HS.get("sources", pd.DataFrame()).copy()
+
+    if len(sources) == 0:
+        raise ValueError("[HeatSlack] HeatSystem.sources 为空，无法设置 slack 热源。")
+    if "node" not in sources.columns:
+        raise ValueError("[HeatSlack] HeatSystem.sources 缺少 node 列。")
+    if "id" not in nodes.columns:
+        raise ValueError("[HeatSlack] HeatSystem.nodes 缺少 id 列。")
+
+    idlist = nodes["id"].astype(int).tolist()
+    inj = np.zeros(len(nodes), dtype=float)
+
+    # 1) 负荷：injection 设为负（抽取）
+    if isinstance(loads, pd.DataFrame) and len(loads) > 0:
+        if "Q_demand" not in loads.columns:
+            loads["Q_demand"] = 0.0
+        if "node" not in loads.columns:
+            raise ValueError("[HeatSlack] HeatSystem.loads 缺少 node 列，无法定位负荷节点。")
+
+        for _, rr in loads.iterrows():
+            if pd.isna(rr.get("Q_demand")) or pd.isna(rr.get("node")):
+                continue
+            nid = int(rr["node"])
+            if nid not in idlist:
+                continue
+            Q_MW = float(rr["Q_demand"])
+            m = (Q_MW * 1e6) / (cp * dT)  # kg/s
+            inj[idlist.index(nid)] -= m   # 负荷是抽取：负号
+
+    # 2) slack 热源：sources 第一行作为 slack（注入）
+    src_node = int(sources.loc[sources.index[0], "node"])
+    if src_node not in idlist:
+        raise ValueError(f"[HeatSlack] slack source node={src_node} 不在 heat_nodes.id 中")
+    src_pos = idlist.index(src_node)
+
+    inj[src_pos] = -inj.sum()   # 保证 sum(injection)=0
+
+    # 3) 把 slack 注入换算回 MW，写回 sources.output，保证 MW↔kg/s 一致
+    Q_src_MW = inj[src_pos] * cp * dT / 1e6
+    sources.loc[sources.index[0], "output"] = float(Q_src_MW)
+
+    nodes["injection"] = inj
+    HS["nodes"] = nodes
+    HS["sources"] = sources
+    HS["loads"] = loads
+    return HS
 
 # ========================= 逐时主流程 =========================
 
@@ -425,6 +566,10 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
     # 电源出力分解（内部机组 vs 外部电网）
     # index = ['Internal_gen', 'Grid_import']，单位 MW
     perh_power_gen_mix = {}
+    perh_gas_network_mix = {}   # metric -> Hxx
+    perh_grid_trade_mix  = {}   # metric -> Hxx
+    perh_EH_output_mix   = {}   # metric -> Hxx
+
 
     try:
         stor = build_runtime_from_TS(TS0, delta_t_hours=1.0)
@@ -544,6 +689,8 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
         # 2.4 把售电作为 BUS7 的额外负荷
         if P_sell > 1e-6:
             extra_loads.append((ext_bus_id, P_sell))
+        # --- 记录购售电（用于绘图/核算）---
+        perh_grid_trade_mix[_hcol(h)] = pd.Series({"Buy_MW": float(P_buy), "Sell_MW": float(P_sell)})
 
         # 3) 运行潮流（把储能 + 外部购售电一起带进去）
         TS_h = run_power_flow(
@@ -628,14 +775,10 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
         try:
             pw = TS_h.get("PowerSystem", {})
             res = pw.get("results", {})
-            baseMVA = float(TS_h['PowerSystem']['baseMVA'])
             gen_res = np.asarray(res.get("gen"))
             if gen_res is not None and gen_res.size > 0:
                 gen_bus = gen_res[:, 0].astype(int)
-                PG_pu   = gen_res[:, 1].astype(float)
-
-                # 关键一步：从 “缩小了 baseMVA 倍的 PG” 还原成 MW
-                PG_MW   = PG_pu * baseMVA
+                PG_MW   = gen_res[:, 1].astype(float)  # 现在直接就是 MW
 
                 if extgrid_bus_id is not None:
                     ext_mask = (gen_bus == int(extgrid_bus_id))
@@ -659,14 +802,70 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
             bus_ids = TS_h['PowerSystem']['bus'][:,0].astype(int)
             w_map = {int(b): float(EN[i]) for i,b in enumerate(bus_ids)}
             stor.update_states(h, w_map)
+            
+        TS_h = _overlay_gas_timeseries(TS_h, inputs_wide, h)
+        TS_h = _overlay_gas_loads(TS_h, inputs_wide, h)
         TS_h = run_gas_flow(TS_h)
         TS_h = run_energy_hub(TS_h)
+        
+        # --- 记录气网供需（换算为 MW）---
+        try:
+            gs = TS_h.get("GasSystem", {})
+            B = 10.45  # MWh/(km^3)
+            loads_df = gs.get("loads", None)
+            src_df   = gs.get("sources", None)
+            comp_df  = gs.get("compressors", None)
 
-        # 读取 EH 的 heat_o1（作为热源侧“供给能力”和“充热来源”）
-        eh_out = TS_h['EnergyHubs']['outputs']
-        h1 = eh_out[eh_out['type'].astype(str).str.lower()=='heat_o1'].iloc[0]
-        Q_eh_MW = float(h1['flow'])          # MW
-        w_eh    = float(h1['PCI'])           # tCO2/MWh
+            load_k = float(loads_df["demand"].fillna(0.0).astype(float).sum()) if isinstance(loads_df, pd.DataFrame) else 0.0
+            sup_k  = float(src_df["output"].fillna(0.0).astype(float).sum()) if isinstance(src_df, pd.DataFrame) else 0.0
+            comp_k = float(comp_df["gasconsumption"].fillna(0.0).astype(float).sum()) if isinstance(comp_df, pd.DataFrame) and "gasconsumption" in comp_df.columns else 0.0
+
+            slack_k = 0.0
+            if isinstance(src_df, pd.DataFrame):
+                if "is_slack" in src_df.columns:
+                    slack_k = float(src_df.loc[src_df["is_slack"].fillna(0).astype(int) == 1, "output"].fillna(0.0).astype(float).sum())
+                else:
+                    slack_k = float(src_df["output"].fillna(0.0).astype(float).iloc[0]) if len(src_df) else 0.0
+
+            perh_gas_network_mix[_hcol(h)] = pd.Series({
+                "Supply_MW":      sup_k  * B,
+                "Load_MW":        load_k * B,
+                "Compressor_MW":  comp_k * B,
+                "Slack_supply_MW": slack_k * B,
+            })
+        except Exception:
+            pass
+
+        TS_h = run_energy_hub(TS_h)
+        # --- 记录 EH 输出汇总（用于 EH 平衡图）---
+        try:
+            eh = TS_h.get("EnergyHubs", {})
+            out = eh.get("outputs", None)
+            if isinstance(out, pd.DataFrame) and "type" in out.columns and "flow" in out.columns:
+                t = out["type"].astype(str).str.lower()
+                f = out["flow"].fillna(0.0).astype(float)
+
+                elec_out = float(f[t.str.startswith("electricity")].sum())
+                heat_out = float(f[t.str.startswith("heat")].sum())
+                cool_out = float(f[t.str.startswith("cooling")].sum())
+                
+                perh_EH_output_mix[_hcol(h)] = pd.Series({
+                    "Electric_out_MW": elec_out,
+                    "Heat_out_MW":     heat_out,
+                    "Cooling_out_MW":  cool_out,
+                })
+        except Exception:
+            pass
+
+        eh_out = TS_h['EnergyHubs']['outputs'].copy()
+        eh_out['type_norm'] = eh_out['type'].astype(str).str.lower()
+        mask_h = eh_out['type_norm'].str.startswith('heat_')
+        Q_eh_MW = float(eh_out.loc[mask_h, 'flow'].fillna(0.0).sum())
+        if Q_eh_MW > 1e-9:
+            w_eh = float((eh_out.loc[mask_h, 'PCI'].fillna(0.0) * eh_out.loc[mask_h, 'flow'].fillna(0.0)).sum() / Q_eh_MW)
+        else:
+            w_eh = 0.0
+
 
         # 当小时热负荷（优先满足）
         HS = TS_h['HeatSystem']
@@ -693,6 +892,11 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
             Q_out_setpoint_MW=float(Q_out_sp),
             w_in_t_per_MWh=w_eh
         )
+        # === after pit.step(...) ===
+        snap = pit.get_state_snapshot()  # returns e_state_MWh, w_es_t_per_MWh, E_state_tCO2, ...
+        perh_pit_e[_hcol(h)] = pd.Series({"PIT": float(snap.get("e_state_MWh", 0.0))})
+        perh_pit_wes[_hcol(h)] = pd.Series({"PIT": float(snap.get("w_es_t_per_MWh", 0.0))})
+        perh_pit_E[_hcol(h)] = pd.Series({"PIT": float(snap.get("E_state_tCO2", 0.0))})
 
         # 合并到“热源侧”：总供热=EH直供 + 池放热
         Q_pit_out = float(res_pit['Q_out_MW'])
@@ -706,27 +910,53 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
             GCI_mix = 0.0
 
         # 覆盖热源：把“并联合成源”写入 HeatSystem.sources[0]
-        HS['sources'].loc[0, 'output'] = Q_to_heat          # MW
-        HS['sources'].loc[0, 'GCI']    = GCI_mix            # tCO2/MWh
+        # --- 新增：Demand 必须满足 → slack 热源自动补齐 ---
+        slack_heat_MW = max(demand_MW - Q_to_heat, 0.0)     # 外部补齐热量（MW）
+        Q_to_heat_total = Q_to_heat + slack_heat_MW         # 应等于 demand_MW
+
+        # slack 热源的碳强度（可按需要改成从表读取）
+        GCI_slack = 0.222  # tCO2/MWh（例如气锅炉 0.20/0.9≈0.222；也可改成固定值/表内值）
+
+        if Q_to_heat_total > 1e-9:
+            GCI_mix_total = (Q_eh_direct * w_eh + Q_pit_out * w_pit_out + slack_heat_MW * GCI_slack) / Q_to_heat_total
+        else:
+            GCI_mix_total = 0.0
+
+        # 先把“对热网的总供给”和碳强度写入 sources[0]
+        HS['sources'].loc[0, 'output'] = float(Q_to_heat_total)   # MW，保证满足需求
+        HS['sources'].loc[0, 'GCI']    = float(GCI_mix_total)     # tCO2/MWh
+
+        # 关键：重构 nodes.injection（kg/s）并用 slack 平衡，保证数值一致
+        HS = _heat_build_injection_with_slack(HS, dT=15.0, cp=4200.0)
+
+        # --- 立即做一致性校验（强烈建议保留）---
+        # 需求 MW
+        demand_chk = float(HS['loads']['Q_demand'].fillna(0.0).astype(float).sum()) if isinstance(HS.get('loads', None), pd.DataFrame) else 0.0
+        # 由 injection 反算出来的 slack 供给 MW（应≈demand_chk）
+        nodes_chk = HS['nodes']
+        idlist = nodes_chk['id'].astype(int).tolist()
+        src_node = int(HS['sources'].loc[0, 'node'])
+        src_pos = idlist.index(src_node)
+        inj_src = float(nodes_chk.loc[src_pos, 'injection'])
+        Q_src_chk = inj_src * 4200.0 * 15.0 / 1e6
+
+        print(f"[HEAT SLACK CHECK h={h}] Demand={demand_chk:.3f} MW | ToHeat(EH+Pit)={Q_to_heat:.3f} MW | Slack={slack_heat_MW:.3f} MW | Source_from_inj={Q_src_chk:.3f} MW")
+
         TS_h['HeatSystem'] = HS
 
-        # 记录 24h 曲线（储热 SoC / 碳势 / 碳库存）
-        perh_pit_e[_hcol(h)]   = pd.Series([res_pit['e_state_MWh']],       index=['pit'])
-        perh_pit_wes[_hcol(h)] = pd.Series([res_pit['w_es_t_per_MWh']],    index=['pit'])
-        perh_pit_E[_hcol(h)]   = pd.Series([res_pit['E_state_t']],         index=['pit'])
-
-        # （可选）并联系统分流统计
+        # （可选）并联系统分流统计：建议把 slack 也记进去，后面画图/排查非常有用
         perh_heat_source_mix[_hcol(h)] = pd.Series({
             'EH_total':      Q_eh_MW,
             'EH_direct':     Q_eh_direct,
             'Pit_out':       Q_pit_out,
-            'ToHeat_total':  Q_to_heat,
+            'ToHeat_total':  float(Q_to_heat_total),
             'Demand':        demand_MW,
-            'Charge_to_pit': Q_charge
+            'Charge_to_pit': Q_charge,
+            'Slack_heat':    slack_heat_MW
         })
-        # —— 然后再跑热网
-        TS_h = run_heat_flow(TS_h)
 
+        # 然后再跑热网
+        TS_h = run_heat_flow(TS_h)
 
         # ----- 电侧：节点碳势（tCO2/MWh）
         pw = TS_h.get("PowerSystem", {})
@@ -854,6 +1084,11 @@ def run_timeseries_day_wide(dataset_dir: str, out_dir: str, hours: int = 24,
         _wide_from_series_dict(perh_pit_wes, "scope").to_excel(w, sheet_name="storage_heat_wes_tperMWh", index=False)
         _wide_from_series_dict(perh_pit_E,   "scope").to_excel(w, sheet_name="storage_heat_E_t", index=False)
         _wide_from_series_dict(perh_heat_source_mix, "metric").to_excel(w, sheet_name="heat_source_mix_MW", index=False)
+        # --- 新增：气网供需汇总 / 购售电 / EH输出汇总（用于能量平衡绘图）---
+        _wide_from_series_dict(perh_gas_network_mix, "metric").to_excel(w, sheet_name="gas_network_mix_MW", index=False)
+        _wide_from_series_dict(perh_grid_trade_mix,  "metric").to_excel(w, sheet_name="grid_trade_mix_MW", index=False)
+        _wide_from_series_dict(perh_EH_output_mix,   "metric").to_excel(w, sheet_name="EH_output_mix_MW", index=False)
+
 
         # 内部机组 / 外部电网出力（来自逐时潮流结果）
         _wide_from_series_dict(

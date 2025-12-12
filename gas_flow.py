@@ -2,101 +2,119 @@ import numpy as np
 
 def run_gas_flow(TS):
     """
-    气网潮流 + CEF（与给定 MATLAB 逻辑一致 or 更优）
+    气网潮流 + CEF
     约定：
-      - 所有流率单位：km^3/h
-      - B = 10.45 MWh/(km^3), CI = 0.20 tCO2/MWh
-      - nodes.injection：正=从节点流出（负荷/压缩机消耗），负=流入（气源注入）
-      - Ag(i,j) = 1 表示管段 j 流入节点 i；Ag(i,j) = -1 表示管段 j 从节点 i 流出
-      - Ag @ m_dot ≈ injection
-    输出：
-      - nodes['injection'], pipes['flowrate'], nodes/pipes/loads/compressors 的 CEFR
-      - 统一两位小数的 *_disp 字段
-      - TS['GasSystem']['Ag']
+      - 流率：km^3/h
+      - nodes.injection：正=消耗(负荷/压缩机)，负=注入(气源)
+      - 若 gas_sources 含 is_slack=1：该源 output 由本函数按气量平衡自动求解
     """
 
-    # ---- 读取并复制（不污染原 DF）----
     nodes        = TS['GasSystem']['nodes'].copy()
     pipes        = TS['GasSystem']['pipelines'].copy()
     compressors  = TS['GasSystem']['compressors'].copy()
     sources      = TS['GasSystem']['sources'].copy()
     loads        = TS['GasSystem']['loads'].copy()
 
-    # ---- 基本参数 ----
     B  = 10.45  # MWh/(km^3)
     CI = 0.20   # tCO2/MWh
 
-    # ---- 节点/管段数量，注意用行数而不是 index 值 ----
-    N_node = len(nodes)
+    # ---------- 节点 id -> 位置索引（避免 “-1” 假设 node 必从 1 连续编号） ----------
+    node_ids = nodes['id'].astype(int).to_numpy()
+    pos = {int(nid): i for i, nid in enumerate(node_ids)}
+    N_node = len(node_ids)
     N_pipe = len(pipes)
 
-    # ---- 统一使用“位置索引 iloc”保证与矩阵列对齐（避免 index 不连续导致错位）----
-    # 构造注入向量：正出负入
+    def _must_pos(nid: int, where: str):
+        if int(nid) not in pos:
+            raise KeyError(f"[GasFlow] {where}: node id={nid} 不在 gas_nodes.id 中")
+        return pos[int(nid)]
+
+    # ---------- 1) 统计总需求（正向消耗） ----------
+    demand_load = float(loads['demand'].fillna(0.0).astype(float).sum()) if len(loads) else 0.0
+    demand_comp = float(compressors['gasconsumption'].fillna(0.0).astype(float).sum()) if len(compressors) else 0.0
+    total_demand = demand_load + demand_comp  # km3/h
+
+    # ---------- 2) slack 源识别 ----------
+    if 'is_slack' in sources.columns:
+        slack_mask = sources['is_slack'].fillna(0).astype(int).to_numpy() == 1
+    else:
+        # 兼容旧表：默认第一台源为 slack
+        slack_mask = np.zeros(len(sources), dtype=bool)
+        if len(sources) > 0:
+            slack_mask[0] = True
+            sources['is_slack'] = 0
+            sources.loc[sources.index[0], 'is_slack'] = 1
+
+    if slack_mask.sum() != 1:
+        raise ValueError(f"[GasFlow] 目前实现为“单 slack 源”，请确保 gas_sources.is_slack 恰好有且仅有一个 1；当前={int(slack_mask.sum())}")
+
+    # 非 slack 源视为“固定源”（output 已在 TS 中，可能被横表覆盖过）
+    fixed_mask = ~slack_mask
+    fixed_out = sources.loc[fixed_mask, 'output'].fillna(0.0).astype(float).to_numpy()
+    total_fixed_supply = float(fixed_out.sum())  # km3/h
+
+    # slack 需要承担的供气量
+    slack_need = total_demand - total_fixed_supply
+    if slack_need < -1e-8:
+        raise ValueError(
+            f"[GasFlow] 固定气源供给({total_fixed_supply:.6f}) > 总需求({total_demand:.6f})，"
+            "会导致 slack_need 为负。请调小固定源或允许外送/弃气（当前未建模）。"
+        )
+    slack_idx = int(np.where(slack_mask)[0][0])
+    sources.loc[sources.index[slack_idx], 'output'] = float(slack_need)
+
+    # ---------- 3) 组装 injection（正消耗、负注入） ----------
     inject = np.zeros(N_node, dtype=float)
 
-    # 气源：流入节点（负值）
+    # 气源：负注入
     for r in sources.itertuples(index=False):
-        node_idx = int(getattr(r, 'node')) - 1   # 1-based -> 0-based
-        out_val  = float(getattr(r, 'output'))
-        inject[node_idx] -= out_val
+        nid = int(getattr(r, 'node'))
+        out_val = float(getattr(r, 'output'))
+        inject[_must_pos(nid, "gas_sources")] -= out_val
 
-    # 负荷：从节点流出（正值）
+    # 负荷：正消耗
     for r in loads.itertuples(index=False):
-        node_idx = int(getattr(r, 'node')) - 1
-        dem_val  = float(getattr(r, 'demand'))
-        inject[node_idx] += dem_val
+        nid = int(getattr(r, 'node'))
+        dem_val = float(getattr(r, 'demand'))
+        inject[_must_pos(nid, "gas_loads")] += dem_val
 
-    # 压缩机自耗气：从所在节点流出（正值）
-    # 若多台压缩机位于同一节点，累加
+    # 压缩机：正消耗（location 是节点 id）
     for r in compressors.itertuples(index=False):
-        node_idx = int(getattr(r, 'location')) - 1
+        nid = int(getattr(r, 'location'))
         cons_val = float(getattr(r, 'gasconsumption'))
-        inject[node_idx] += cons_val
+        inject[_must_pos(nid, "gas_compressors")] += cons_val
 
     nodes['injection'] = inject
+    TS['GasSystem']['sources'] = sources  # 关键：把 slack 计算后的 output 写回
 
-    # ---- 关联系数矩阵 Ag（N_node × N_pipe）----
+    # ---------- 4) 构造 Ag（N_node × N_pipe） ----------
     Ag = np.zeros((N_node, N_pipe), dtype=float)
-    # 严格用 iloc 的列序构造，以保证与 m_dot 列对应
     for j in range(N_pipe):
-        f = int(pipes.iloc[j]['from']) - 1   # 1-based -> 0-based
-        t = int(pipes.iloc[j]['to'])   - 1
-        Ag[f, j] = -1.0   # 从 f 流出
-        Ag[t, j] =  1.0   # 流入 t
+        f_id = int(pipes.iloc[j]['from'])
+        t_id = int(pipes.iloc[j]['to'])
+        f = _must_pos(f_id, "gas_pipelines.from")
+        t = _must_pos(t_id, "gas_pipelines.to")
+        Ag[f, j] = -1.0
+        Ag[t, j] =  1.0
 
-    # ---- 管段流率 m_dot：Ag * m_dot = inject ----
-    # MATLAB 的 "\" 为最小二乘求解；这里用 lstsq 等价
-    m_dot, residuals, rank, s = np.linalg.lstsq(Ag, inject, rcond=None)
+    # ---------- 5) 求管段流率 ----------
+    # 当 sum(injection)=0 时，理论可解；这里仍用最小二乘与原逻辑一致
+    m_dot, *_ = np.linalg.lstsq(Ag, inject, rcond=None)
     pipes['flowrate'] = m_dot
 
-    # ---- CEF 计算（与 MATLAB 一致）----
-    CEFR_nodes = B * CI * inject           # tCO2/h
-    CEFR_pipes = B * CI * m_dot            # tCO2/h
-    CEFR_loads = B * CI * loads['demand'].to_numpy(dtype=float)  # tCO2/h
+    # ---------- 6) CEFR ----------
+    CEFR_nodes = B * CI * inject
+    CEFR_pipes = B * CI * m_dot
+    CEFR_loads = B * CI * loads['demand'].to_numpy(dtype=float)
+    CEFR_compressors_direct = B * CI * compressors['gasconsumption'].to_numpy(dtype=float)
 
     nodes['CEFR'] = CEFR_nodes
     pipes['CEFR'] = CEFR_pipes
 
-    # 压缩机碳流率（“更优”口径）：直接按自耗气量计算
-    # 说明：你给的 MATLAB 代码里：CEFR_compressor = nodes.CEFR(compressors.location(1)) - pipes.CEFR(compressors.location(1))
-    # 该写法把“管段 CEFR”按“节点索引”取值，存在口径/下标不一致问题。
-    # 这里给出两种：优先推荐“直接按自耗”法；若你坚持复刻，可解开下方 MATLAB 风格的近似。
-    CEFR_compressors_direct = B * CI * compressors['gasconsumption'].to_numpy(dtype=float)  # tCO2/h（推荐）
-    # —— 可选：粗复刻 MATLAB 近似（不建议）——
-    # CEFR_compressors_matlab_like = []
-    # for r in compressors.itertuples(index=False):
-    #     node_idx = int(getattr(r, 'location')) - 1
-    #     # 如果硬要用“节点 CEFR - 同号管段 CEFR”，那这里只能勉强取“与该节点相连的任一入段或出段”做近似
-    #     # 为避免强行错位，这里就不实现该不严谨写法了。
-
-    # ---- 自检：平衡与残差（可留作日志）----
-    # 1) 方程残差 ||Ag*m_dot - inject||
     res_vec = Ag @ m_dot - inject
     res_norm = float(np.linalg.norm(res_vec, ord=2))
-    # 2) 简单守恒：Σ(injection) ≈ 0（孤岛/泄漏等情况下可能非零）
     sum_inject = float(inject.sum())
 
-    # ---- 写回 TS ----
     TS['GasSystem']['nodes'] = nodes
     TS['GasSystem']['pipelines'] = pipes
     TS['GasSystem']['Ag'] = Ag
@@ -105,7 +123,7 @@ def run_gas_flow(TS):
     TS['GasSystem']['residual_norm'] = res_norm
     TS['GasSystem']['sum_injection'] = sum_inject
 
-    # ---- 展示用：两位小数副本（不影响内部精度）----
+    # display
     TS['GasSystem']['nodes_CEFR_disp']        = np.round(CEFR_nodes, 2)
     TS['GasSystem']['pipes_CEFR_disp']        = np.round(CEFR_pipes, 2)
     TS['GasSystem']['loads_CEFR_disp']        = np.round(CEFR_loads, 2)
@@ -116,19 +134,7 @@ def run_gas_flow(TS):
     TS['GasSystem']['residual_norm_disp']     = round(res_norm, 6)
     TS['GasSystem']['sum_injection_disp']     = round(sum_inject, 6)
 
-    # ---- 控制台打印（两位小数）----
-    def _fmt2(arr):  # 仅用于打印
-        return np.array2string(np.asarray(arr),
-                               formatter={'float_kind': lambda x: f"{x:.2f}"},
-                               max_line_width=200, threshold=1e6)
-    print('气网节点流率向量 mq_dot (km^3/h):\n', _fmt2(inject))
-    print('气网关联矩阵 Ag:\n', _fmt2(Ag))
-    print('气网管段流率向量 m_dot (km^3/h):\n', _fmt2(m_dot))
-    print('气网节点碳流率 CEFR_nodes (tCO2/h):\n', _fmt2(CEFR_nodes))
-    print('气网管段碳流率 CEFR_pipes (tCO2/h):\n', _fmt2(CEFR_pipes))
-    print('气网负荷碳流率 CEFR_loads (tCO2/h):\n', _fmt2(CEFR_loads))
-    print('气网压缩机碳流率 CEFR_compressors (tCO2/h, direct by consumption):\n',
-          _fmt2(CEFR_compressors_direct))
-    print(f'[诊断] ||Ag*m_dot - injection||_2 = {res_norm:.6e} ; sum(injection) = {sum_inject:.6e}')
+    print(f"[GasFlow] total_demand={total_demand:.6f} km3/h | fixed_supply={total_fixed_supply:.6f} | slack={slack_need:.6f}")
+    print(f"[GasFlow] ||Ag*m_dot - injection||_2 = {res_norm:.6e} ; sum(injection) = {sum_inject:.6e}")
 
     return TS

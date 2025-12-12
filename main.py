@@ -13,8 +13,11 @@ from io_utils import save_results_to_excel
 
 
 # 你给出的数据目录（可以按需修改/传参）
-DATASET_DIR = r"F:\25秋科研资料\IES_critical_modelling\dataset"
-OUTPUT_DIR  = os.path.join(DATASET_DIR, "outputs")
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_DIR = PROJECT_ROOT / "dataset"
+OUTPUT_DIR  = DATASET_DIR / "outputs"
 
 def main():
     # === 读取 Excel 构建系统 ===
@@ -29,7 +32,6 @@ def main():
         w_es0=None
     )
     pit = PitThermalStorage(pit_cfg)
-
 
     print(">>> [1/4] Power Flow + CEF (PYPOWER style)")
     TS = run_power_flow(TS)

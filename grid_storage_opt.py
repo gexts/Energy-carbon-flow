@@ -359,12 +359,13 @@ def write_optimized_dispatch(dataset_in: str,
 
     return df_ch, df_dc, df_buy, df_sell
 
+from pathlib import Path
 
 if __name__ == "__main__":
-    # 把 ROOT 设置为 dataset 目录
-    ROOT = r"F:\25秋科研资料\IES_critical_modelling\dataset"
-    dataset_in = os.path.join(ROOT, "ies_dataset_extgrid.xlsx")
-    dataset_out = os.path.join(ROOT, "ies_dataset.xlsx")
+    ROOT = Path(__file__).resolve().parent / "dataset"
+    dataset_in  = ROOT / "ies_dataset_extgrid.xlsx"
+    dataset_out = ROOT / "ies_dataset.xlsx"
+
 
     if os.path.exists(dataset_in):
         print(f"[INFO] 使用数据文件: {dataset_in}")

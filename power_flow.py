@@ -1,7 +1,7 @@
 # power_flow.py — 稳健版（不改库）：
 # 1) 使用 DC 初值 + 连续同伦（60%→80%→90%→100%）以增强收敛；
 # 2) 全程关闭库内 Q 限分支（ENFORCE_Q_LIMS=0），绕开浮点索引/括号优先级问题；
-# 3) CEF 计算使用 p.u. 功率矩阵（PB/PG/PL/RBloss 全部除以 baseMVA），
+# 3) CEF 计算使用 p.u. 功率矩阵，
 #    与 MATLAB 结果数值一一对齐；同时也回写物理量 t/h 版本供后续使用。
 
 import numpy as np
@@ -101,12 +101,12 @@ def _build_and_sanitize(TS):
         gen[i0, PG] = min(gen[i0, PMAX], gen[i0, PG] + need)
 
     ppc['bus'], ppc['gen'], ppc['branch'] = bus, gen, branch
-    # --- 若输入为 MW，则统一转换成 p.u. ---
-    cols_power_bus = [2, 3]       # PD, QD
-    cols_power_gen = [1, 2, 3, 4, 8, 9]  # PG, QG, QMAX, QMIN, PMAX, PMIN
-    bus[:, cols_power_bus] /= ppc['baseMVA']
-    gen[:, cols_power_gen] /= ppc['baseMVA']
+
+    # 统一口径：保持 MATPOWER/PYPOWER 约定的物理量单位
+    # bus 的 PD/QD、gen 的 PG/QG/PMAX/PMIN 等均使用 MW/MVAr
+    # baseMVA 仅作为网络基准值供内部标幺换算使用
     return ppc
+
 
 def _ppopt(ac_method=1, enforce_q=0, init_from_dc=True, verbose=2):
     # ac_method: 1=NR, 2=FDBX
@@ -153,20 +153,21 @@ def run_power_flow(TS, extra_loads=None, extra_gens=None, extra_ci=None, verbose
     ppc = _build_and_sanitize(TS)
 
     # === [STORAGE HOOK] apply extra injections before solving (in p.u. domain) ===
+# === [STORAGE/GRID HOOK] apply extra injections before solving (MW/MVAr domain) ===
     if extra_loads or extra_gens:
-        baseMVA = ppc['baseMVA']
+        baseMVA = ppc['baseMVA']  # 仅用于 gen 的 MBASE 字段
 
-        # 充电 -> 负荷（MW -> p.u. 叠加到 PD 列，索引 2）
+        # 充电/售电等 -> 负荷（直接以 MW 叠加到 PD 列，索引 2）
         if extra_loads:
             for (bus_id, P_MW) in extra_loads:
                 rows = np.where(ppc['bus'][:, 0].astype(int) == int(bus_id))[0]
                 if rows.size > 0:
                     r = int(rows[0])
-                    ppc['bus'][r, 2] += float(P_MW) / baseMVA  # PD
+                    ppc['bus'][r, 2] += float(P_MW)  # PD [MW]
 
-        # 放电 -> 新增机组（MW -> p.u.），并为每个新增机组追加一行 gencost
+        # 放电/购电等 -> 新增机组（直接以 MW 写入 PG/PMAX）
         if extra_gens:
-            new_gencost_rows = []  # 收集待追加的 gencost 行
+            new_gencost_rows = []
             for item in extra_gens:
                 if len(item) == 3:
                     bus_id, P_MW, ci_val = item
@@ -174,17 +175,20 @@ def run_power_flow(TS, extra_loads=None, extra_gens=None, extra_ci=None, verbose
                     bus_id, P_MW = item
                     ci_val = 0.0
 
+                P_MW = float(P_MW)
+
                 new = np.zeros((1, ppc['gen'].shape[1]), dtype=float)
-                new[0, 0] = int(bus_id)                 # GEN_BUS
-                new[0, 1] = float(P_MW) / baseMVA       # PG (p.u.)
-                new[0, 2] = 0.0                         # QG
-                new[0, 3] = 1e3                         # QMAX
-                new[0, 4] = -1e3                        # QMIN
-                new[0, 5] = 1.0                         # VG
-                new[0, 6] = baseMVA                     # MBASE
-                new[0, 7] = 1.0                         # GEN_STATUS
-                new[0, 8] = max(new[0, 1] * 1.2, 0.001) # PMAX (p.u.)
-                new[0, 9] = 0.0                         # PMIN
+                new[0, 0] = int(bus_id)         # GEN_BUS
+                new[0, 1] = P_MW                # PG [MW]
+                new[0, 2] = 0.0                 # QG [MVAr]
+                new[0, 3] = 1e3                 # QMAX
+                new[0, 4] = -1e3                # QMIN
+                new[0, 5] = 1.0                 # VG
+                new[0, 6] = baseMVA             # MBASE
+                new[0, 7] = 1.0                 # GEN_STATUS
+                new[0, 8] = max(P_MW * 1.2, 0.001)  # PMAX [MW]
+                new[0, 9] = 0.0                 # PMIN [MW]
+
                 ppc['gen'] = np.vstack([ppc['gen'], new])
 
                 # 记录对应的碳强度，供 CEF 拼接
@@ -193,21 +197,20 @@ def run_power_flow(TS, extra_loads=None, extra_gens=None, extra_ci=None, verbose
                 else:
                     TS['__extra_gci__'] = np.vstack([TS['__extra_gci__'], [[float(ci_val)]]])
 
-                # 追加一行默认 gencost（与 _build_and_sanitize 里保持一致的 7 列格式）
+                # 追加一行默认 gencost（保持你原逻辑不变）
                 gc_cols = ppc['gencost'].shape[1] if 'gencost' in ppc else 7
                 row = np.zeros((1, gc_cols), dtype=float)
-                row[0, 0] = 2      # MODEL=polynomial
-                # STARTUP(1) & SHUTDOWN(2) 留 0
-                row[0, 3] = 3      # NCOST
-                row[0, 4] = 1e-2   # c2
-                row[0, 5] = 1.0    # c1
-                # c0(6) 留 0
+                row[0, 0] = 2
+                row[0, 3] = 3
+                row[0, 4] = 1e-2
+                row[0, 5] = 1.0
                 new_gencost_rows.append(row)
 
             if 'gencost' in ppc:
                 ppc['gencost'] = np.vstack([ppc['gencost']] + new_gencost_rows)
             else:
                 ppc['gencost'] = np.vstack(new_gencost_rows)
+
     # === [STORAGE HOOK END] ===
 
 

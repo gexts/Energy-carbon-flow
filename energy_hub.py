@@ -20,17 +20,28 @@ def run_energy_hub(TS):
     gnode = int(EH['connectednodes']['gasnode'])
 
     # -------- 输入能流（MW）--------
-    # 电：母线有功负荷 Pd
-    Pd = TS['PowerSystem']['bus'][:, 2]     # PD (MW)
-    E = float(Pd[pnode - 1])
-
-    # 气：节点 injection（km^3/h，正=从节点流出=节点消耗），按热值换算为 MW
     B = 10.45  # MWh/(km^3)
-    gas_nodes = TS['GasSystem']['nodes']
-    inj_series = gas_nodes.loc[gas_nodes['id'] == gnode, 'injection']
-    if inj_series.empty:
-        raise ValueError(f"Gas node id={gnode} not found in GasSystem.nodes")
-    G = float(inj_series.iloc[0]) * B       # MW（注意：不取绝对值，保持与 MATLAB 一致）
+    use_inputs = bool(EH.get("respect_inputs", False))
+
+    if use_inputs and "inputs" in EH and hasattr(EH["inputs"], "copy"):
+        inp = EH["inputs"].copy()
+        inp["type_norm"] = inp["type"].astype(str).str.lower()
+        e_row = inp[inp["type_norm"] == "electricity"]
+        g_row = inp[inp["type_norm"] == "gas"]
+        E = float(e_row["flow"].iloc[0]) if len(e_row) else 0.0
+        G = float(g_row["flow"].iloc[0]) if len(g_row) else 0.0
+    else:
+        # 电：来自电网母线PD（节点5时序负荷）
+        Pd = TS['PowerSystem']['bus'][:, 2]     # PD (MW)
+        E = float(Pd[pnode - 1])
+
+        # 气：来自气网节点 injection（节点5时序负荷聚合后的注入）
+        gas_nodes = TS['GasSystem']['nodes']
+        inj_series = gas_nodes.loc[gas_nodes['id'] == gnode, 'injection']
+        if inj_series.empty:
+            raise ValueError(f"Gas node id={gnode} not found in GasSystem.nodes")
+        G = float(inj_series.iloc[0]) * B       # MW
+
 
     # 写回 inputs
     EH['inputs'].loc[EH['inputs']['type'] == 'electricity', 'flow'] = E
@@ -42,11 +53,34 @@ def run_energy_hub(TS):
     EH['inputs'].loc[EH['inputs']['type'] == 'electricity', 'PCI'] = PCI_e
     EH['inputs'].loc[EH['inputs']['type'] == 'gas',         'PCI'] = PCI_g
 
-    # -------- 设备效率与比例 --------
-    etaCHPW, etaCHPQ = 0.30, 0.45
-    etaAB = 0.75
-    etaCERG, etaWARG = 3.0, 0.70
-    X, Y, Z, W, U = 0.214286, 0.206608, 1/6, 2/3, 0.739633
+    # -------- 设备效率与比例（支持从 Excel eh_meta 读取 + 供热优先模式）--------
+    params = EH.get("params", {}) or {}
+    mode = str(params.get("mode", "")).strip().lower()
+
+    # 默认（保持你原来的）
+    etaCHPW = float(params.get("etaCHPW", 0.30))
+    etaCHPQ = float(params.get("etaCHPQ", 0.45))
+    etaAB   = float(params.get("etaAB",   0.75))
+    etaCERG = float(params.get("etaCERG", 3.0))
+    etaWARG = float(params.get("etaWARG", 0.70))
+    X = float(params.get("X", 0.214286))
+    Y = float(params.get("Y", 0.206608))
+    Z = float(params.get("Z", 1/6))
+    W = float(params.get("W", 2/3))
+    U = float(params.get("U", 0.739633))
+
+    # 供热优先：减少“去制冷”的分流，把气尽量用于供热
+    # 这一套在你 h=23 的 E=3.79, G=12.42 条件下，热输出会从 ~2.30 MW 提升到 ~10.09 MW
+    if mode in ("heat_priority", "heat-first", "heat_first"):
+        etaCHPW = float(params.get("etaCHPW", 0.33))
+        etaCHPQ = float(params.get("etaCHPQ", 0.55))
+        etaAB   = float(params.get("etaAB",   0.90))
+        X       = float(params.get("X",       0.08))
+        Y       = float(params.get("Y",       0.25))
+        Z       = float(params.get("Z",       0.05))
+        W       = float(params.get("W",       0.0))
+        U       = float(params.get("U",       0.0))
+
 
     # -------- 能量耦合矩阵 C（严格按 MATLAB）--------
     # 输出顺序： [elec_o1, elec_o2, heat_o1, heat_o2, cool_o1, cool_o2]
@@ -103,14 +137,6 @@ def run_energy_hub(TS):
     EH['outputs_disp']['PCI']  = np.round(out['PCI'].to_numpy(), 2)
     EH['outputs_disp']['CEFR'] = np.round(out['CEFR'].to_numpy(), 2)
 
-    # --------（可选）把热源写回热网：使用 heat_o1 的功率与其 PCI --------
-    # 对齐你之前的做法：把 EH 的第3个输出（heat_o1）作为热网热源，并赋其 GCI = 对应 PCI
-    if 'HeatSystem' in TS and 'sources' in TS['HeatSystem']:
-        try:
-            TS['HeatSystem']['sources'].loc[0, 'output'] = float(flows[2])
-            TS['HeatSystem']['sources'].loc[0, 'GCI']    = float(PCIs[2])
-        except Exception:
-            pass
 
     # -------- 控制台打印，两位小数 --------
     def _fmt2(a):

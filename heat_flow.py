@@ -13,19 +13,19 @@ def run_heat_flow(TS):
     # ===== 读取 =====
     HS = TS['HeatSystem']
     nodes = HS['nodes'].copy()
+    # ---- ensure float dtype (avoid int64 -> float assignment issues) ----
+    if 'temperature' in nodes.columns:
+        nodes['temperature'] = nodes['temperature'].astype(float)
+    else:
+        nodes['temperature'] = 80.0
     pipes = HS['pipelines'].copy()
     sources = HS['sources'].copy()
     valve_params = HS.get('valves', None)
     pump_params  = HS.get('pumps',  None)
 
-    # ===== 与 EH 对接：更新热源（heat_o1）=====
-    EH_out = TS['EnergyHubs']['outputs']
-    mask_h1 = EH_out['type'].astype(str).str.lower() == 'heat_o1'
-    if not mask_h1.any():
-        raise ValueError("EnergyHub.outputs 中没有 'heat_o1' 输出")
-    sources.loc[0, 'output'] = float(EH_out.loc[mask_h1, 'flow'].iloc[0])  # MW
-    sources.loc[0, 'GCI']    = float(EH_out.loc[mask_h1, 'PCI' ].iloc[0])  # tCO2/MWh
-    GCI_heat = float(sources.loc[0, 'GCI'])
+   # ===== 热源 GCI（由 scenario_runner 覆盖写入）=====
+    GCI_heat = float(sources.loc[0, 'GCI']) if (len(sources) > 0 and 'GCI' in sources.columns) else 0.0
+
 
     # ===== 常数 =====
     rho = 1000.0  # kg/m^3
@@ -150,42 +150,54 @@ def run_heat_flow(TS):
         raise RuntimeError(f"水力计算未在 {iter_max} 次迭代内收敛")
     print(f"水力计算在 {iter} 次迭代后收敛，最终误差：{err:.3f}")
 
-    # ===== 稳态热力计算（与 MATLAB 等价；仅做轻微的除零与指数夹取）=====
-    m = mb.copy()                           # kg/s  （带符号）
-    m_safe = np.where(np.abs(m) < 1e-9, 1e-9, m)  # 防除零，仅用于 Rh
+    # ===== 稳态热力计算（数值稳定版：热损&混合用 |m|；小流量保护）=====
+    m = mb.copy()  # kg/s (signed)
+    m_eps = 1e-6
+    m_abs = np.abs(m)
+    m_abs_safe = np.where(m_abs < m_eps, m_eps, m_abs)  # ONLY for thermal calculations
+    m_eff = np.where(m_abs < m_eps, 0.0, m)             # used in energy/CEFR to avoid tiny*huge
 
     A  = -Ah
-    Af = np.zeros_like(A); Af[A > 0] = 1.0
-    At_ = np.zeros_like(A); At_[A < 0] = 1.0
+    Af = np.zeros_like(A);  Af[A > 0] = 1.0
+    At = np.zeros_like(A);  At[A < 0] = 1.0
 
-    # At_：按“带符号 m”加权并行归一（与 MATLAB 一致）
+    # At_：按“|m|”加权并行归一（物理混合权重必须为正）
+    At_ = At.copy()
     for i in range(npipe):
-        At_[:, i] = At_[:, i] * m[i]
+        At_[:, i] = At_[:, i] * m_abs_safe[i]
     row_sum = At_.sum(axis=1, keepdims=True)
     row_sum[row_sum == 0] = 1.0
     At_ = At_ / row_sum
 
-    Tin   = nodes['temperature'].to_numpy(dtype=float) if 'temperature' in nodes else np.zeros(nnodes)
-    Etemp = pipes['deltaT'    ].to_numpy(dtype=float) if 'deltaT' in pipes else np.zeros(npipe)
+    Tin   = nodes['temperature'].to_numpy(dtype=float)
+    Etemp = pipes['deltaT'].to_numpy(dtype=float) if 'deltaT' in pipes else np.zeros(npipe)
 
-    # Z = Rh（Rh~1/m^2 始终为正），指数使用“带符号 m”
-    Rh   = miu / (c**2 * (m_safe**2))
-    expo = -c * m * Rh * L                 # 带符号 m
-    expo = np.clip(expo, -50.0, 50.0)      # 防溢出，不改变物理
+    # 热损因子 K 必须在 (0,1]，指数使用 |m|
+    Rh   = miu / (c**2 * (m_abs_safe**2))
+    expo = -c * m_abs_safe * Rh * L
+    expo = np.clip(expo, -50.0, 0.0)
     Kdiag = np.exp(expo)
-    K = np.diag(Kdiag)
+    Kdiag_safe = np.where(Kdiag < 1e-12, 1e-12, Kdiag)
 
     I = np.eye(npipe)
-    Aheat = I - K @ Af.T @ At_
-    rhs   = K @ Af.T @ Tin + Etemp
+    Aheat = I - np.diag(Kdiag) @ Af.T @ At_
+    rhs   = np.diag(Kdiag) @ Af.T @ Tin + Etemp
+
     try:
         Tt = np.linalg.solve(Aheat, rhs)
     except np.linalg.LinAlgError:
-        # 极端病态时的兜底（不改变理论解）
         Tt = np.linalg.lstsq(Aheat, rhs, rcond=None)[0]
-    Tf = np.linalg.solve(K, (Tt - Etemp))
 
-    # ===== 回写 =====
+    Tf = (Tt - Etemp) / Kdiag_safe
+
+    # 对近零流量的管段：视为无输运，冻结温度以避免数值噪声
+    zero_mask = (m_abs < m_eps)
+    if np.any(zero_mask):
+        Tin_from = (Af.T @ Tin)
+        Tf[zero_mask] = Tin_from[zero_mask]
+        Tt[zero_mask] = Tin_from[zero_mask]
+
+# ===== 回写 =====
     pipes['massflow'] = mb
     pipes['T_in']  = Tf
     pipes['T_out'] = Tt
@@ -198,11 +210,11 @@ def run_heat_flow(TS):
         nodes.at[f_idx[j], 'temperature'] = Tf[j]
 
     # ===== CEF =====
-    Q_pipes_W  = c * m * Tt
+    Q_pipes_W  = c * m_eff * Tt
     Q_pipes_MW = Q_pipes_W / 1e6
     CEFR_pipes = Q_pipes_MW * GCI_heat   # tCO2/h
 
-    Q_out_W  = c * m * (Tf - Tt)
+    Q_out_W  = c * m_eff * (Tf - Tt)
     Q_out_MW = Q_out_W / 1e6
     CEFR_pipes_output = GCI_heat * Q_out_MW
     Q_total_MW = float(Q_out_MW.sum())

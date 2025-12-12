@@ -135,6 +135,24 @@ def _read_eh(dataset_dir):
         "powernode": int(meta["powernode"].iloc[0]),
         "gasnode": int(meta["gasnode"].iloc[0])
     }
+    # 把 eh_meta 里除 powernode/gasnode 以外的列都当作 params
+    params = {}
+    for c in meta.columns:
+        if c in ("powernode", "gasnode"):
+            continue
+        try:
+            params[c] = meta[c].iloc[0]
+        except Exception:
+            pass
+    ...
+    return {
+        "id": 1,
+        "connectednodes": connectednodes,
+        "inputs": inputs,
+        "outputs": outputs,
+        "params": params,          # ← 新增
+    }
+
     # 最少要有 type 列
     if "type" not in inputs:  inputs["type"]  = ["electricity","gas"]
     if "flow" not in inputs:  inputs["flow"]  = [None]*len(inputs)
